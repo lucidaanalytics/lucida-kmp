@@ -12,7 +12,13 @@ data class WireframeMasking(
     val maskSandboxedViews: Boolean = true,
     val maxDepth: Int = 40,
     val maxNodes: Int = 1500,
+    /** SCREENSHOT sends a JPEG of the window instead of the wireframe; the mask plan is painted before encoding. */
+    val mode: ReplayMode = ReplayMode.WIREFRAME,
+    /** JPEG quality 1..100 for [ReplayMode.SCREENSHOT]. */
+    val screenshotQuality: Int = 40,
 )
+
+enum class ReplayMode { WIREFRAME, SCREENSHOT }
 
 /**
  * View tags a host can set (Android `view.tag`, iOS `accessibilityIdentifier`):

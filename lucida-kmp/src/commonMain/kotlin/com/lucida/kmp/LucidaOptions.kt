@@ -13,6 +13,10 @@ data class LucidaOptions(
     val flags: FlagOptions = FlagOptions(),
     val flagDefinitions: List<Obj> = emptyList(),
     val replay: ReplayOptions = ReplayOptions(),
+    /** `$autocapture` taps/changes and `$rageclick`; off by default. The Android and iOS adapters build the element chain. */
+    val autocapture: AutocaptureConfig = AutocaptureConfig(),
+    /** In-app guides (`GET /v1/guides`); off by default. Android and iOS default the presenter to a native alert. */
+    val guides: GuidesConfig = GuidesConfig(),
     val reuseAnonymousId: Boolean = false,
     val anonymousIdProvider: (() -> String)? = null,
     val queueCipher: QueueCipher? = null,

@@ -13,6 +13,8 @@ class Lucida(
     deviceProperties: Obj = emptyMap(),
     flagOptions: FlagOptions = FlagOptions(),
     replayOptions: ReplayOptions = ReplayOptions(),
+    autocaptureConfig: AutocaptureConfig = AutocaptureConfig(),
+    guidesConfig: GuidesConfig = GuidesConfig(),
     private val io: Scheduler = newScheduler("lucida-io"),
 ) {
     val core = Core(config)
@@ -20,6 +22,8 @@ class Lucida(
     val flags = Flags(core, flagDefinitions, deviceProperties, appVersion, flagOptions)
     val lifecycle = Lifecycle(core, appVersion, appBuild)
     val replay = ReplayRecorder(core, replayOptions, flagEnabled = { flags.isEnabled(it) })
+    val autocapture = Autocapture(core, autocaptureConfig)
+    val guides = GuidesService(core, guidesConfig) { flags.isEnabled(it) }
 
     /** Emit launch lifecycle events, then load remote replay config and flags in the background. */
     fun start() {
@@ -30,10 +34,11 @@ class Lucida(
     private fun reloadAll() {
         replay.loadRemote()
         if (preload) flags.reload()
+        guides.reload()
     }
 
     fun capture(event: String, properties: Obj = emptyMap(), set: Obj? = null, setOnce: Obj? = null) = core.capture(event, properties, set, setOnce)
-    fun screen(name: String, properties: Obj = emptyMap()): Obj? = core.screen(name, properties)
+    fun screen(name: String, properties: Obj = emptyMap()): Obj? = core.screen(name, properties).also { guides.show(name) }
 
     fun identify(id: String, set: Obj? = null, setOnce: Obj? = null) {
         core.identify(id, set, setOnce)
@@ -88,14 +93,18 @@ class Lucida(
     /**
      * Record one screen: `$screen` plus (when the replay gates pass) a wireframe of [walk]'s tree. The walker only runs
      * when the recorder will use its result, so a gated or throttled screen costs nothing. Call on the UI thread.
+     * Screenshot mode: [shot] turns the walked (marker-applied) tree into an already-masked frame; a null frame
+     * (nothing drawable yet) skips this screen rather than falling back to an unmasked wireframe.
      */
-    fun captureScreen(screen: String, width: Int, height: Int, walk: () -> ViewNode) {
-        core.screen(screen)
+    fun captureScreen(screen: String, width: Int, height: Int, shot: ((ViewNode) -> ScreenshotFrame?)? = null, walk: () -> ViewNode) {
+        this.screen(screen)
         if (!replay.shouldCapture(screen)) {
             replay.screen(ViewNode(ViewKind.CONTAINER, 0, 0, 0, 0), screen, 0, 0) // lets a denied screen pause recording
             return
         }
-        replay.screen(walk(), screen, width, height)
+        val tree = walk()
+        val frame = shot?.let { it(tree) ?: return }
+        replay.screen(tree, screen, width, height, frame)
     }
 
     /** A tap in dp (decor/window coordinates). */
@@ -137,6 +146,8 @@ class Lucida(
                 },
                 flagOptions = options.flags,
                 replayOptions = options.replay,
+                autocaptureConfig = options.autocapture,
+                guidesConfig = options.guides,
             )
             c.core.register(mapOf("\$os" to d.os, "\$os_version" to d.osVersion, "\$device_model" to d.model))
             c.start()

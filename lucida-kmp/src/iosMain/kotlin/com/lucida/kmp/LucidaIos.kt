@@ -31,6 +31,7 @@ object LucidaIos {
     private var tapTarget: TapTarget? = null
 
     fun init(apiKey: String, apiHost: String, options: LucidaOptions = LucidaOptions(), replayMasking: WireframeMasking? = null): Lucida {
+        if (options.guides.presenter == null) options.guides.presenter = AlertGuidePresenter { keyWindow() }
         val c = Lucida.create(apiKey, apiHost, options)
         client = c
         masking = replayMasking
@@ -54,14 +55,23 @@ object LucidaIos {
                 return@dispatch_async
             }
             val (width, height) = w.bounds.useContents { size.width.roundToInt() to size.height.roundToInt() }
-            client.captureScreen(name, width, height) { UIKitViewHierarchy(m).capture(w, MarkerRegistry.snapshot()) }
+            val regions = MarkerRegistry.snapshot()
+            val shot = if (m.mode == ReplayMode.SCREENSHOT) {
+                { tree: ViewNode -> UIKitScreenshot.capture(w, ScreenshotMasks.plan(tree, regions), m.screenshotQuality) }
+            } else {
+                null
+            }
+            client.captureScreen(name, width, height, shot) { UIKitViewHierarchy(m).capture(w, regions) }
         }
     }
 
     /** A tap in points, window coordinates. */
     fun tap(x: Double, y: Double) = client.tap(x, y)
 
-    /** Adds a pass-through tap recognizer to the key window so taps land in the replay (no effect on other touches). */
+    /**
+     * Adds a pass-through tap recognizer to the key window so taps land in the replay and, with `options.autocapture`
+     * enabled, as `$autocapture` events (no effect on other touches).
+     */
     fun installTapRecorder() {
         dispatch_async(dispatch_get_main_queue()) {
             val w = keyWindow() ?: return@dispatch_async
@@ -77,7 +87,15 @@ object LucidaIos {
     private class TapTarget(private val c: Lucida) : NSObject(), UIGestureRecognizerDelegateProtocol {
         @kotlinx.cinterop.ObjCAction
         fun tapped(r: UITapGestureRecognizer) {
-            r.locationInView(null).useContents { c.tap(x, y) }
+            val w = r.view ?: return
+            r.locationInView(null).useContents {
+                c.tap(x, y) // no-op until a replay snapshot exists
+                if (c.autocapture.cfg.enabled) {
+                    val chain = UIKitAutocapture.chain(w, x, y)
+                    c.autocapture.tap(chain, x, y)
+                    if (UIKitAutocapture.leafIsToggle(w, x, y)) c.autocapture.change(chain)
+                }
+            }
         }
 
         override fun gestureRecognizer(gestureRecognizer: UIGestureRecognizer, shouldRecognizeSimultaneouslyWithGestureRecognizer: UIGestureRecognizer) = true

@@ -179,6 +179,9 @@ class CoreOptionsTest {
         val h = c.tracing.headersFor("https://api.example.com/v1/x")
         assertEquals(c.distinctId, h["X-Lucida-Distinct-Id"])
         assertNotNull(h["X-Lucida-Session-Id"])
+        assertEquals("lucida.session_id=${h["X-Lucida-Session-Id"]}", h["baggage"])
+        val merged = c.tracing.headersFor("https://api.example.com/v1/x", "a=1, lucida.session_id=old,b=2")["baggage"]
+        assertEquals("a=1,b=2,lucida.session_id=${h["X-Lucida-Session-Id"]}", merged, "keeps app baggage, replaces the stale Lucida entry")
         assertTrue(c.tracing.headersFor("https://a.corp.io/x").isNotEmpty())
         assertTrue(c.tracing.headersFor("https://corp.io/x").isEmpty())
         assertTrue(c.tracing.headersFor("https://other.com/x").isEmpty())

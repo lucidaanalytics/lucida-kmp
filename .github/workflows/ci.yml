@@ -17,6 +17,9 @@ jobs:
           distribution: temurin
           java-version: "17"
       - run: ./gradlew --no-daemon --console=plain :lucida-kmp:jvmTest
+      # Runner images ship an Android SDK (ANDROID_HOME), so the androidMain actuals (Keystore cipher, screenshot,
+      # autocapture, guides alert) compile here too.
+      - run: ./gradlew --no-daemon --console=plain :lucida-kmp:compileDebugKotlinAndroid
   ios:
     runs-on: macos-latest
     steps:

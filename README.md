@@ -12,6 +12,10 @@ conformance vectors in `testdata/flags`). Artifact package: `com.lucida.kmp`.
 | Flags | local evaluation of bootstrap definitions (spec v1 + v2 ops), server decide (`POST /v1/flags`), cached last response, `$feature_flag_called`, `$feature/<key>` enrichment | `Flags`, `FlagEval` |
 | Remote config | `GET /v1/config` tightens replay sample rate, kill switch, min duration | `ReplayRecorder.loadRemote` |
 | Replay | rrweb mobile wireframe (Meta, FullSnapshot, taps), seq per window, gzip POST `/v1/replay` | `Wireframe`, `ReplayRecorder` |
+| Autocapture | `$autocapture` taps/changes and `$rageclick` (off by default; input text never read, `lc-no-capture` skips a subtree) | `Autocapture` + `AutocaptureViews` (Android) / `UIKitAutocapture` (iOS) |
+| Guides | `GET /v1/guides`, modal/banner/announcement/slideout/tour; url (screen), flag, sample, devices, seen targeting (other keys skip the guide); native alert presenter | `GuidesService` + `AlertGuidePresenter` |
+| Screenshot replay | `WireframeMasking(mode = ReplayMode.SCREENSHOT)`: the window is drawn, the mask plan painted, then JPEG encoded on device | `ScreenshotCapture` (Android) / `UIKitScreenshot` (iOS) |
+| Queue ciphers | `KeystoreQueueCipher` (Android Keystore AES-256-GCM), `KeychainQueueCipher` (Keychain key, CommonCrypto AES-256-CBC + HMAC-SHA256) | `LucidaOptions.queueCipher` |
 | Ports (expect/actual) | `Lock`, clock, `Scheduler`, `platformDefaults()` = storage + HTTP + device info | `Platform.kt` and the platform source sets |
 
 Platform actuals: Android `SharedPreferences` + `HttpURLConnection` (+ `Window.Callback` tap hook, View-tree walker); iOS
@@ -19,9 +23,10 @@ Platform actuals: Android `SharedPreferences` + `HttpURLConnection` (+ `Window.C
 (`$LUCIDA_HOME` or `~/.lucida`) + `HttpURLConnection`. The JVM target has no view tree, so replay there is a no-op unless you
 hand `Lucida.captureScreen` a `ViewNode` tree yourself.
 
-Not ported (platform UI or host-specific, use the native SDK): in-app guides, `$autocapture` element chains, screenshot replay
-mode, Compose markers, the Keystore/Keychain queue ciphers. Apple uploads use a gzip container with stored (uncompressed)
-blocks; the server only needs the container.
+Not ported: Compose markers (use `sdks/android`'s `lucida-compose`). Network and log capture are Watchtower's (see
+`docs/seam/watchtower.md`): requests to `tracingHeaders` hosts carry `baggage: lucida.session_id=<id>` so Watchtower links its
+spans and logs to the session. Apple uploads use a gzip container with stored (uncompressed) blocks; the server only needs the
+container.
 
 ## Install
 
