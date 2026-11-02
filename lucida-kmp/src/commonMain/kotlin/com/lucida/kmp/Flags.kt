@@ -189,8 +189,9 @@ class Flags(
 
     /** false | true | variant key. Emits `$feature_flag_called` once per key/value; fallbacks emit nothing. */
     fun get(key: String): Any? {
+        // a configured fallback is served silently; a missing flag without one still reports `false`
         val v = locked { if (values.containsKey(key)) values[key] ?: false else null }
-            ?: return options.fallbacks[key] ?: false
+            ?: options.fallbacks[key]?.let { return it } ?: false
         if (options.sendFeatureFlagEvent && locked { called.add("$key=$v") }) {
             core.capture("\$feature_flag_called", mapOf("\$feature_flag" to key, "\$feature_flag_response" to v))
         }
