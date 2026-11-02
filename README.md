@@ -83,6 +83,13 @@ Set `accessibilityIdentifier = "lc-block" | "lc-ignore" | "lc-mask" | "lc-unmask
 Replay needs `analytics` and `replay` consent. Sampling is per session, `ReplayOptions.throttleMs` spaces captures, a screen
 is re-captured only when the throttle allows or the session rotated, and chunks (`seq` per window) go out with the queue flush.
 
+## Fallbacks and flag details
+
+`LucidaOptions(flags = FlagOptions(fallbacks = mapOf("new_nav" to false)))` serves that value, reason `fallback`, when a flag has no
+value (missing, failed load, cold start); fallback reads emit no `$feature_flag_called`. `lucida.flags.getFeatureFlagDetails("key")`
+returns `FlagDetails` (value, payload, variant, raw `reason`, `conditionIndex`, `requestId`, `evaluatedLocally`), or null for an
+unknown key without a fallback. `lucida.flags.onFlagsStatus { CHANGED | STALE | ERROR }` reports reloads.
+
 ## Test
 
 ```

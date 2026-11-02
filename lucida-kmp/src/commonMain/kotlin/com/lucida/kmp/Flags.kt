@@ -15,6 +15,9 @@ class Flags(
     private val personProps = LinkedHashMap<String, Any?>()
     private val groupProps = LinkedHashMap<String, Map<String, Any?>>()
     private val listeners = Listeners<(Obj) -> Unit>()
+    private val statusListeners = Listeners<(FlagsStatus) -> Unit>()
+    private val meta = HashMap<String, Triple<String, Int, Boolean>>() // reason, condition index, evaluated locally
+    private var loaded = false
 
     private var values = LinkedHashMap<String, Any?>()
     private var payloads = LinkedHashMap<String, Any?>()
@@ -48,6 +51,23 @@ class Flags(
     /** Called after every successful reload with all flag values. */
     fun onFeatureFlags(fn: (Obj) -> Unit) {
         listeners.add(fn)
+    }
+
+    /** CHANGED after each successful reload, STALE when a reload fails after a success, ERROR when none has succeeded yet. */
+    fun onFlagsStatus(fn: (FlagsStatus) -> Unit) {
+        statusListeners.add(fn)
+    }
+
+    private fun fail() {
+        val s = if (locked { loaded }) FlagsStatus.STALE else FlagsStatus.ERROR
+        statusListeners.forEach { it(s) }
+    }
+
+    private fun publish() {
+        locked { loaded = true }
+        val snapshot = all()
+        listeners.forEach { it(snapshot) }
+        statusListeners.forEach { it(FlagsStatus.CHANGED) }
     }
 
     /** Person properties used for flag evaluation only (no `$set` event, so no ingestion race). */
@@ -98,6 +118,7 @@ class Flags(
                 else {
                     v[k] = r["value"]
                     r["payload"]?.let { p[k] = it }
+                    meta[k] = Triple(r["reason"] as? String ?: "", (r["condition_index"] as? Number)?.toInt() ?: -1, true)
                 }
             }
             local = v
@@ -110,8 +131,7 @@ class Flags(
     fun reload() {
         val mine = locked { ++seq }
         if (!evalLocal()) {
-            val snapshot = all()
-            listeners.forEach { it(snapshot) }
+            publish()
             return
         }
         if (!core.consent.has("analytics")) return
@@ -127,14 +147,19 @@ class Flags(
             },
         )
         val r = core.cfg.http.send("POST", "${core.host}/v1/flags", body, mapOf("Content-Type" to "application/json"))
-        if (r.status !in 200..299) return
-        val j = runCatching { Json.decodeObj(r.body) }.getOrNull() ?: return
+        val j = if (r.status in 200..299) runCatching { Json.decodeObj(r.body) }.getOrNull() else null
+        if (j == null) {
+            fail()
+            return
+        }
         val v = LinkedHashMap<String, Any?>()
         val p = LinkedHashMap<String, Any?>()
+        val m = HashMap<String, Triple<String, Int, Boolean>>()
         (j["flags"] as? Map<*, *>)?.forEach { (k, x) ->
             if (x is Map<*, *>) {
                 v[k as String] = x["value"] ?: x["variant"] ?: (x["enabled"] == true)
                 x["payload"]?.let { p[k] = it }
+                m[k] = Triple(x["reason"] as? String ?: "", (x["condition_index"] as? Number)?.toInt() ?: -1, false)
             } else {
                 v[k as String] = x
             }
@@ -144,15 +169,28 @@ class Flags(
             requestId = j["request_id"] as? String
             values = LinkedHashMap(local + v)
             payloads = p
+            meta.putAll(m)
             core.storage.set(CACHE, Json.encode(mapOf("values" to values, "payloads" to payloads)))
         }
-        val snapshot = all()
-        listeners.forEach { it(snapshot) }
+        publish()
     }
 
-    /** false | true | variant key. Emits `$feature_flag_called` once per key/value. */
+    /**
+     * Value, payload, variant, raw Lucida reason and request id. A key with no value is served from
+     * `FlagOptions.fallbacks` with reason `fallback` (no event); null when it has no fallback either.
+     */
+    fun getFeatureFlagDetails(key: String): FlagDetails? {
+        val known = locked { values.containsKey(key) }
+        if (!known) return options.fallbacks[key]?.let { FlagDetails(it, null, null, "fallback", -1, null, false) }
+        val v = get(key)
+        val (m, rid, pl) = locked { Triple(meta[key], requestId, payloads[key]) }
+        return FlagDetails(v, pl, v as? String, m?.first ?: "", m?.second ?: -1, rid, m?.third ?: false)
+    }
+
+    /** false | true | variant key. Emits `$feature_flag_called` once per key/value; fallbacks emit nothing. */
     fun get(key: String): Any? {
-        val v = locked { values[key] ?: false }
+        val v = locked { if (values.containsKey(key)) values[key] ?: false else null }
+            ?: return options.fallbacks[key] ?: false
         if (options.sendFeatureFlagEvent && locked { called.add("$key=$v") }) {
             core.capture("\$feature_flag_called", mapOf("\$feature_flag" to key, "\$feature_flag_response" to v))
         }
