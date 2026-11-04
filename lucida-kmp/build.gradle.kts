@@ -74,12 +74,17 @@ tasks.withType<KotlinNativeSimulatorTest>().configureEach {
     testLogging { events("started", "passed", "skipped", "failed"); showStandardStreams = true }
 }
 
-// Keychain entitlement for the iOS test host: the simulator takes entitlements from the Mach-O `__TEXT,__entitlements`
-// section (what Xcode embeds for simulator builds), so KeychainQueueCipherTest can use the real Keychain.
-kotlin.targets.configureEach {
-    if (name.startsWith("ios")) {
-        (this as org.jetbrains.kotlin.gradle.plugin.mpp.KotlinNativeTarget).binaries.getTest("DEBUG")
-            .linkerOpts("-Wl,-sectcreate,__TEXT,__entitlements,${file("ios-test.entitlements").absolutePath}")
+// Keychain entitlement for the iOS test host: the simulator only honours entitlements from a code signature, so the
+// linked test binary is ad-hoc signed with ios-test.entitlements (lets KeychainQueueCipherTest use the real Keychain).
+tasks.withType<org.jetbrains.kotlin.gradle.tasks.KotlinNativeLink>().configureEach {
+    if (name.startsWith("link") && name.contains("Test") && name.contains("Ios")) {
+        val entitlements = file("ios-test.entitlements")
+        doLast {
+            val kexe = binary.outputFile
+            val p = ProcessBuilder("codesign", "--force", "--sign", "-", "--entitlements", entitlements.absolutePath, kexe.absolutePath)
+                .inheritIO().start()
+            check(p.waitFor() == 0) { "codesign of ${kexe.name} failed" }
+        }
     }
 }
 
