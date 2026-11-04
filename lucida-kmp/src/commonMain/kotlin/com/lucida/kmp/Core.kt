@@ -57,7 +57,12 @@ class Core(val cfg: CoreConfig) {
         clock, cfg.queue("$host/v1/batch"), cfg.onDrop,
     )
     private val hooks = HookChain(cfg.beforeSend) { debugLog(it) }
+    /** Events captured before consent (opt-in + queueBeforeConsent). Guarded by [heldLock], which may take Consent.lock inside. */
     private val held = ArrayList<Obj>()
+    private val heldLock = Lock()
+
+    /** Serialises [setConsent] callers (it writes the consent record and flushes gated storage); capture never takes it. */
+    private val consentChange = Lock()
     private val listeners = Listeners<(Obj) -> Unit>()
 
     val tracing = TracingHeaders(cfg.tracingHeaders, cfg.apiHost, { consent.has("analytics") }) { distinctId to session.touch() }
@@ -84,43 +89,56 @@ class Core(val cfg: CoreConfig) {
     @Volatile var enricher: ((String) -> Obj?)? = null
 
     fun capture(event: String, properties: Obj = emptyMap(), set: Obj? = null, setOnce: Obj? = null): Obj? {
-        return locked {
-            if (cfg.disabled) return null
-            val granted = consent.has("analytics")
-            if (!granted && !(consent.pending && consent.queueBeforeConsent)) return null
-            // Person writes are blocked in NEVER mode and mark the device identified in IDENTIFIED_ONLY mode.
-            val writes = !set.isNullOrEmpty() || !setOnce.isNullOrEmpty()
-            if (writes && person.blocksPersonWrites) debugLog("personProfiles=never: ignoring \$set/\$set_once on $event")
-            if (writes || event == "\$identify" || event == "\$create_alias" || event == "\$groupidentify") person.markIdentified()
-            val g = groupState.all()
-            val now = clock.nowMs()
-            val personless = person.personless(event)
-            val e = LinkedHashMap<String, Any?>().apply {
-                put("uuid", uuidv7(now))
-                put("event", event)
-                put("distinct_id", identity.distinctId)
-                put("timestamp", Instant.ofEpochMilli(now).toString())
-                put(
-                    "properties",
-                    LinkedHashMap(
-                        (enricher?.invoke(event) ?: emptyMap()) + props.all() + properties + mapOf(
-                            "\$session_id" to session.touch(), "\$window_id" to session.windowId,
-                            "\$lib" to cfg.libName, "\$lib_version" to cfg.libVersion,
-                        ),
-                    ).also {
-                        if (personless) it["\$process_person_profile"] = false
-                        if (cfg.disableGeoip) it["\$geoip_disable"] = true
-                    },
-                )
-                if (!set.isNullOrEmpty() && !person.blocksPersonWrites) put("\$set", set)
-                if (!setOnce.isNullOrEmpty() && !person.blocksPersonWrites) put("\$set_once", setOnce)
-                if (g != null) put("\$groups", g)
-            }
-            val out = hooks.run(e) ?: return null
-            listeners.forEach { it(out) }
-            if (granted) queue.enqueue(out) else if (held.size < cfg.queue("").maxQueueSize) held.add(out)
-            return out
+        if (cfg.disabled) return null
+        if (!consent.has("analytics") && !(consent.pending && consent.queueBeforeConsent)) return null
+        // Person writes are blocked in NEVER mode and mark the device identified in IDENTIFIED_ONLY mode.
+        val writes = !set.isNullOrEmpty() || !setOnce.isNullOrEmpty()
+        if (writes && person.blocksPersonWrites) debugLog("personProfiles=never: ignoring \$set/\$set_once on $event")
+        if (writes || event == "\$identify" || event == "\$create_alias" || event == "\$groupidentify") person.markIdentified()
+        val g = groupState.all()
+        val now = clock.nowMs()
+        val personless = person.personless(event)
+        val e = LinkedHashMap<String, Any?>().apply {
+            put("uuid", uuidv7(now))
+            put("event", event)
+            put("distinct_id", identity.distinctId)
+            put("timestamp", Instant.ofEpochMilli(now).toString())
+            put(
+                "properties",
+                LinkedHashMap(
+                    (enricher?.invoke(event) ?: emptyMap()) + props.all() + properties + mapOf(
+                        "\$session_id" to session.touch(), "\$window_id" to session.windowId,
+                        "\$lib" to cfg.libName, "\$lib_version" to cfg.libVersion,
+                    ),
+                ).also {
+                    if (personless) it["\$process_person_profile"] = false
+                    if (cfg.disableGeoip) it["\$geoip_disable"] = true
+                },
+            )
+            if (!set.isNullOrEmpty() && !person.blocksPersonWrites) put("\$set", set)
+            if (!setOnce.isNullOrEmpty() && !person.blocksPersonWrites) put("\$set_once", setOnce)
+            if (g != null) put("\$groups", g)
         }
+        val out = hooks.run(e) ?: return null // user hooks run holding no lock
+        listeners.forEach { it(out) }
+        route(out)
+        return out
+    }
+
+    /**
+     * Decides, atomically with respect to [setConsent], whether [out] goes to the queue or the pre-consent buffer. The
+     * queue re-checks consent under its own lock, so an event that raced a revoke is refused rather than queued after the clear.
+     */
+    private fun route(out: Obj) {
+        val toQueue = heldLock.withLock {
+            if (consent.has("analytics")) {
+                true
+            } else {
+                if (consent.pending && consent.queueBeforeConsent && held.size < cfg.queue("").maxQueueSize) held.add(out)
+                false
+            }
+        }
+        if (toQueue) queue.enqueueIf(out) { consent.has("analytics") }
     }
 
     fun identify(id: String, set: Obj? = null, setOnce: Obj? = null) {
@@ -172,25 +190,30 @@ class Core(val cfg: CoreConfig) {
 
     /** Record a consent decision. Granting analytics releases state and held events; revoking drops them. */
     fun setConsent(update: Map<String, Boolean>) {
-        locked {
+        val before = consent.has("analytics")
+        val after = update["analytics"] ?: before
+        if (before && !after) {
+            capture("\$opt_out")
+            queue.drainThenClear()
+        }
+        var release: List<Obj> = emptyList()
+        var granted = false
+        consentChange.withLock {
             val was = consent.has("analytics")
-            val will = update["analytics"] ?: was
-            if (was && !will) {
-                capture("\$opt_out")
-                queue.drainThenClear()
-            }
             consent.set(update)
-            if (!was && will) {
+            val now = consent.has("analytics")
+            if (!was && now) {
                 gated.flushBuffered()
-                held.toList().forEach(queue::enqueue)
-                held.clear()
-                capture("\$opt_in")
+                release = heldLock.withLock { ArrayList(held).also { held.clear() } }
+                granted = true
             }
-            if (!will) {
-                held.clear()
+            if (!now) {
+                heldLock.withLock { held.clear() }
                 gated.discardBuffered()
             }
         }
+        release.forEach(queue::enqueue)
+        if (granted) capture("\$opt_in")
     }
 
     fun optIn() = setConsent(mapOf("analytics" to true, "replay" to true, "marketing" to true))

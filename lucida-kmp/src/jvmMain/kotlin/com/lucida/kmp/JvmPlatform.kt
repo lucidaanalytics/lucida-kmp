@@ -5,6 +5,7 @@ import java.io.File
 /** [KeyValueStore] over one JSON file (JVM apps, CLIs, tests). Writes are atomic (temp file + rename). */
 class FileStore(private val file: File) : KeyValueStore {
     private val data = LinkedHashMap<String, String>()
+    private val lock = Lock() // this store's own lock: it is the I/O adapter, so the file write is the thing it serialises
 
     init {
         if (file.exists()) {
@@ -12,17 +13,17 @@ class FileStore(private val file: File) : KeyValueStore {
         }
     }
 
-    override fun get(key: String): String? = locked { data[key] }
+    override fun get(key: String): String? = lock.withLock { data[key] }
 
     override fun set(key: String, value: String) {
-        locked {
+        lock.withLock {
             data[key] = value
             persist()
         }
     }
 
     override fun remove(key: String) {
-        locked {
+        lock.withLock {
             if (data.remove(key) != null) persist()
         }
     }

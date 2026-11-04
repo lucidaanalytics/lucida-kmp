@@ -36,6 +36,8 @@ class GuidesService(
     private val random: () -> Double = { Random.nextDouble() },
     private val flag: (String) -> Boolean,
 ) {
+    private val lock = Lock() // state: guides, seen, previewed, showing, screen. A leaf: flag/random/presenter callbacks run outside it.
+    private val ioLock = Lock() // serialises writes of the seen list
     private var guides: List<MobileGuide> = emptyList()
     private val seen: MutableSet<String> = HashSet()
     private val previewed = HashSet<String>()
@@ -55,7 +57,7 @@ class GuidesService(
         val list = (runCatching { Json.decodeObj(r.body) }.getOrNull()?.get("guides") as? List<*>) ?: emptyList<Any?>()
         @Suppress("UNCHECKED_CAST")
         val parsed = list.mapNotNull { runCatching { parse(it as Obj) }.getOrNull() }
-        val at = locked {
+        val at = lock.withLock {
             guides = parsed
             screen
         }
@@ -64,17 +66,26 @@ class GuidesService(
 
     /** The app moved to [name]: show the first eligible guide, if none is on screen. */
     fun show(name: String) {
-        val g = locked {
+        val (all, seenNow, previewedNow) = lock.withLock {
             screen = name
             if (showing) return
-            val pick = guides.firstOrNull { eligible(it, name) } ?: return
-            showing = true
-            if (pick.preview) previewed.add(pick.id)
-            pick
+            Triple(guides, HashSet(seen), HashSet(previewed))
         }
+        // Eligibility asks the flag and sample callbacks (user code), so it runs on a snapshot, outside the lock.
+        val g = all.firstOrNull { eligible(it, name, seenNow, previewedNow) } ?: return
+        val claimed = lock.withLock {
+            if (showing) {
+                false
+            } else {
+                showing = true
+                if (g.preview) previewed.add(g.id)
+                true
+            }
+        }
+        if (!claimed) return
         val p = config.presenter
         if (p == null) {
-            locked { showing = false }
+            lock.withLock { showing = false }
             return
         }
         if (!g.preview) {
@@ -84,7 +95,7 @@ class GuidesService(
         present(p, g, 0)
     }
 
-    private fun eligible(g: MobileGuide, name: String): Boolean {
+    private fun eligible(g: MobileGuide, name: String, seen: Set<String>, previewed: Set<String>): Boolean {
         if (g.kind !in KINDS || g.steps.isEmpty()) return false
         if (g.preview) return g.id !in previewed
         val c = g.conditions
@@ -125,7 +136,7 @@ class GuidesService(
     }
 
     private fun finish() {
-        val at = locked {
+        val at = lock.withLock {
             showing = false
             screen
         }
@@ -133,11 +144,13 @@ class GuidesService(
     }
 
     private fun markSeen(id: String) {
-        val list = locked {
-            seen.add(id)
-            seen.sorted()
+        ioLock.withLock {
+            val list = lock.withLock {
+                seen.add(id)
+                seen.sorted()
+            }
+            core.storage.set(SEEN, Json.encode(list))
         }
-        core.storage.set(SEEN, Json.encode(list))
     }
 
     private fun props(g: MobileGuide, extra: Obj = emptyMap()): Obj = extra + mapOf("\$guide_id" to g.id, "\$guide_kind" to g.kind)

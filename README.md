@@ -103,6 +103,23 @@ cd sdks/kmp
 The flag vectors under `testdata/flags` are read through `readTestdata` (JVM: walks up to `testdata/`; iOS: the Gradle task
 passes `LUCIDA_TESTDATA`).
 
+### iOS keychain test
+
+`KeychainQueueCipherTest` uses the real Keychain. The simulator test host is linked with `lucida-kmp/ios-test.entitlements`
+(`application-identifier` + `keychain-access-groups`, embedded in the Mach-O `__TEXT,__entitlements` section like Xcode does for
+simulator builds), so the round trip runs and asserts. If the runner's keychain still refuses the host the test **fails** with a
+message pointing here; set `LUCIDA_SKIP_KEYCHAIN_TEST=1` in the environment of the Gradle run to opt out explicitly (the
+task forwards it as `SIMCTL_CHILD_LUCIDA_SKIP_KEYCHAIN_TEST`). Nothing skips silently.
+
+## Concurrency
+
+No process-wide lock. Each component (consent, identity, session, super properties, groups, person mode, event queue, flags,
+guides, replay recorder) owns a private lock that guards only its own fields and is never held across storage, HTTP or user
+callbacks (`beforeSend`, listeners, flag callbacks, presenters). Storage writes snapshot the state under the state lock and are
+serialised by a separate per-key write lock, so a slow disk never blocks a state read. The only nesting is the documented
+table in `Platform.kt` (queue and consent buffer into the consent lock). `ConcurrencyTest` (JVM) covers concurrent
+capture / identify / register / flag reads, a consent revoke racing capture, and reads during a blocked write.
+
 ---
 
 This repository is a read-only mirror of the Lucida monorepo (synced by a script, never edited by hand); releases and provenance attestations are built here by GitHub Actions. Issues are welcome, changes land upstream.

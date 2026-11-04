@@ -12,17 +12,18 @@ interface KeyValueStore {
 
 class MemoryStore : KeyValueStore {
     val data = LinkedHashMap<String, String>()
+    private val lock = Lock()
 
-    override fun get(key: String) = locked { data[key] }
+    override fun get(key: String) = lock.withLock { data[key] }
 
     override fun set(key: String, value: String) {
-        locked {
+        lock.withLock {
             data[key] = value
         }
     }
 
     override fun remove(key: String) {
-        locked {
+        lock.withLock {
             data.remove(key)
         }
     }

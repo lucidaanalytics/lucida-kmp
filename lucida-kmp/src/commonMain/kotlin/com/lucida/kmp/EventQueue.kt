@@ -30,8 +30,10 @@ class EventQueue(
     private val onDrop: (List<Obj>, String) -> Unit = { _, _ -> },
     private val executor: Scheduler = newScheduler("lucida-queue"),
 ) {
+    private val lock = Lock() // state: items, timer, attempt, closed. A leaf apart from the consent re-check in [enqueueIf].
+    private val ioLock = Lock() // serialises writes of `lc_queue` (snapshot under `lock`, write outside it)
+    private val flushLock = Lock() // one sender at a time; held across the POST, never taken by capture or by state readers
     private val items = ArrayList<Obj>()
-    private val flushLock = Lock()
     private var timer: ScheduledTask? = null
     private var attempt = 0
     private var closed = false
@@ -43,36 +45,56 @@ class EventQueue(
         }
     }
 
-    val size: Int get() = locked { items.size }
+    val size: Int get() = lock.withLock { items.size }
 
-    private fun persist() = locked { if (items.isEmpty()) store.remove(KEY) else store.set(KEY, Json.encode(items)) }
+    private fun persist() = ioLock.withLock {
+        val json = lock.withLock { if (items.isEmpty()) null else Json.encode(items) }
+        if (json == null) store.remove(KEY) else store.set(KEY, json)
+    }
 
     fun enqueue(e: Obj) {
+        enqueueIf(e) { true }
+    }
+
+    /**
+     * Queues [e] unless the queue is closed or [accept] says no. [accept] runs under the queue lock, so a consent check
+     * there cannot be overtaken by a revoke's [clear]: an event is either queued before the clear or refused after it.
+     * Returns whether the event was queued.
+     */
+    fun enqueueIf(e: Obj, accept: () -> Boolean): Boolean {
+        var dropped: List<Obj> = emptyList()
         var flushNow = false
-        locked {
-            if (closed) return
-            items.add(e)
-            if (items.size > cfg.maxQueueSize) {
-                val dropped = items.subList(0, items.size - cfg.maxQueueSize)
-                onDrop(ArrayList(dropped), "queue_full")
-                dropped.clear()
+        val queued = lock.withLock {
+            if (closed || !accept()) {
+                false
+            } else {
+                items.add(e)
+                if (items.size > cfg.maxQueueSize) {
+                    val over = items.subList(0, items.size - cfg.maxQueueSize)
+                    dropped = ArrayList(over)
+                    over.clear()
+                }
+                flushNow = items.size >= cfg.flushAt
+                if (!flushNow) arm(cfg.flushIntervalMs)
+                true
             }
-            persist()
-            flushNow = items.size >= cfg.flushAt
-            if (!flushNow) arm(cfg.flushIntervalMs)
         }
+        if (!queued) return false
+        persist()
+        if (dropped.isNotEmpty()) onDrop(dropped, "queue_full") // user callback: outside every lock
         if (flushNow) executor.execute { flush() }
+        return true
     }
 
     private fun arm(ms: Long) {
-        locked {
+        lock.withLock {
             if (timer?.isDone == false) return
             timer = executor.schedule(ms) { flush() }
         }
     }
 
     private fun disarm() {
-        locked {
+        lock.withLock {
             timer?.cancel()
             timer = null
         }
@@ -82,16 +104,18 @@ class EventQueue(
     fun flush() {
         flushLock.withLock {
             while (true) {
-                val batch: List<Obj>
-                locked {
+                val allowed = cfg.networkAllowed() // user callback: outside the state lock
+                val batch = lock.withLock {
                     disarm()
-                    if (items.isEmpty()) return
-                    if (!cfg.networkAllowed()) {
-                        arm(cfg.flushIntervalMs)
-                        return
+                    when {
+                        items.isEmpty() -> null
+                        !allowed -> {
+                            arm(cfg.flushIntervalMs)
+                            null
+                        }
+                        else -> ArrayList(items.take(cfg.maxBatchSize.coerceAtLeast(1)))
                     }
-                    batch = ArrayList(items.take(cfg.maxBatchSize.coerceAtLeast(1)))
-                }
+                } ?: return
                 val body = Json.encode(
                     mapOf("api_key" to cfg.apiKey, "batch" to batch, "sent_at" to Instant.ofEpochMilli(clock.nowMs()).toString()),
                 )
@@ -103,26 +127,32 @@ class EventQueue(
 
     /** True when the loop should continue with the next batch. */
     private fun settle(batch: List<Obj>, status: Int): Boolean {
-        return locked {
+        var removed = false
+        var dropReason: String? = null
+        val more = lock.withLock {
             if (status in 200..299) {
                 removeSent(batch.size)
+                removed = true
                 attempt = 0
-                return items.isNotEmpty()
-            }
-            if (!isRetryable(status) || attempt >= cfg.maxRetries) {
+                items.isNotEmpty()
+            } else if (!isRetryable(status) || attempt >= cfg.maxRetries) {
                 removeSent(batch.size)
+                removed = true
                 attempt = 0
-                onDrop(batch, "status_$status")
-                return items.isNotEmpty()
+                dropReason = "status_$status"
+                items.isNotEmpty()
+            } else {
+                arm(backoffDelay(attempt++, baseMs = cfg.retryBaseMs, random = cfg.random))
+                false
             }
-            arm(backoffDelay(attempt++, baseMs = cfg.retryBaseMs, random = cfg.random))
-            return false
         }
+        if (removed) persist()
+        dropReason?.let { onDrop(batch, it) }
+        return more
     }
 
     private fun removeSent(n: Int) {
         items.subList(0, minOf(n, items.size)).clear()
-        persist()
     }
 
     /** Flush on the queue thread (never block the caller; Android forbids network on the main thread). */
@@ -139,16 +169,16 @@ class EventQueue(
 
     /** Discard everything (consent revoked). */
     fun clear() {
-        locked {
+        lock.withLock {
             items.clear()
-            store.remove(KEY)
             disarm()
         }
+        persist()
     }
 
     fun shutdown() {
         flush()
-        locked { closed = true }
+        lock.withLock { closed = true }
         disarm()
         executor.shutdown()
     }

@@ -43,21 +43,23 @@ private val ALWAYS_PROCESSED = setOf("\$identify", "\$create_alias", "\$groupide
 
 /** `personProfiles` state: IDENTIFIED_ONLY flips to processing on the first identify/alias/group/person-property write. */
 class PersonMode(private val store: KeyValueStore, val mode: PersonProfiles) {
+    private val lock = Lock()
+    private val ioLock = Lock()
     private var identified = store.get(IDENTIFIED_KEY) == "1"
 
     val blocksPersonWrites get() = mode == PersonProfiles.NEVER
 
     fun markIdentified() {
-        locked {
-            if (mode == PersonProfiles.IDENTIFIED_ONLY && !identified) {
-                identified = true
-                store.set(IDENTIFIED_KEY, "1")
-            }
+        val flipped = lock.withLock {
+            val f = mode == PersonProfiles.IDENTIFIED_ONLY && !identified
+            if (f) identified = true
+            f
         }
+        if (flipped) persist()
     }
 
     /** True when an event of this name should carry `$process_person_profile: false`. */
-    fun personless(event: String): Boolean = locked {
+    fun personless(event: String): Boolean = lock.withLock {
         when (mode) {
             PersonProfiles.ALWAYS -> false
             PersonProfiles.NEVER -> event !in ALWAYS_PROCESSED
@@ -66,9 +68,11 @@ class PersonMode(private val store: KeyValueStore, val mode: PersonProfiles) {
     }
 
     fun reset() {
-        locked {
-            identified = false
-            store.remove(IDENTIFIED_KEY)
-        }
+        lock.withLock { identified = false }
+        persist()
+    }
+
+    private fun persist() = ioLock.withLock {
+        if (lock.withLock { identified }) store.set(IDENTIFIED_KEY, "1") else store.remove(IDENTIFIED_KEY)
     }
 }

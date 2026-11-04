@@ -31,13 +31,26 @@ class ReplayRecorder(
     private val core: Core,
     private val options: ReplayOptions = ReplayOptions(),
     private val chunkEvents: Int = 200,
-    private val maxPendingChunks: Int = 20,
+    spoolBudgetBytes: Long = 10L * 1024 * 1024,
     private val flagEnabled: (String) -> Boolean = { false },
 ) {
-    private class Chunk(val session: String, val seq: Int, val events: List<Obj>, var tries: Int = 0)
+    /** Chunks waiting (min duration, offline, upload backoff) live on disk, encrypted with the queue cipher; nothing is dropped silently. */
+    private val spool = ReplaySpool(
+        core.cfg.queueCipher?.let { EncryptedStore(core.cfg.store, it, setOf("lc_replay"), listOf("lc_replay.")) } ?: core.cfg.store,
+        spoolBudgetBytes,
+    ) { session, chunks, bytes ->
+        core.debugLog("replay spool over budget: dropped session $session ($chunks chunks, $bytes bytes)")
+        core.cfg.onDrop(
+            listOf(mapOf("event" to "\$replay_session_dropped", "properties" to mapOf("session_id" to session, "chunks" to chunks, "bytes" to bytes))),
+            "replay_spool_full",
+        )
+    }
+    private val tries = HashMap<Int, Int>()
+    private val sealIo = Lock() // serialises seals (they write the spool); order: sealIo -> lock
 
+    // State lock: guards the buffers below. Takes only Consent.lock (via `enabled`) and no I/O; the session is touched before it is taken.
+    private val lock = Lock()
     private val buf = ArrayList<Obj>()
-    private val pending = ArrayDeque<Chunk>()
     private var lastSession: String? = null
     private var seq = 0
     private var snapshot: Snapshot? = null
@@ -61,10 +74,12 @@ class ReplayRecorder(
     }
 
     fun stop() {
-        locked {
+        val dropHeld = lock.withLock {
             running = false
-            dropUnreleased()
+            if (!released) buf.clear()
+            !released
         }
+        if (dropHeld) spool.removeHeld() // the session ends before the minimum: held chunks never go out
     }
 
     /** Keeps the recorder alive but captures nothing until [resume]. */
@@ -103,8 +118,10 @@ class ReplayRecorder(
         (needsSnapshot || core.clock.nowMs() - lastScreenAt >= options.throttleMs)
 
     fun screen(root: ViewNode, screen: String, width: Int, height: Int, frame: ScreenshotFrame? = null) {
-        locked {
-            if (!isActive) return
+        if (!isActive) return // asks the session, the flag callback and consent: outside the lock
+        val now = core.clock.nowMs()
+        val full = lock.withLock {
+            if (!running) return
             screenAllowed = ReplayPolicy.screenAllowed(screen, options.screenAllowList, options.screenDenyList)
             if (!screenAllowed) {
                 // Entering a denied screen pauses recording; coming back takes a fresh snapshot and taps there are dropped.
@@ -112,7 +129,6 @@ class ReplayRecorder(
                 snapshot = null
                 return
             }
-            val now = core.clock.nowMs()
             if (!needsSnapshot && now - lastScreenAt < options.throttleMs) return
             lastScreenAt = now
             val s = if (frame != null) {
@@ -123,91 +139,102 @@ class ReplayRecorder(
             snapshot = s
             needsSnapshot = false
             buf.addAll(s.events)
-            sealIfFull()
+            buf.size >= chunkEvents
         }
+        if (full) seal()
     }
 
     fun tap(x: Double, y: Double) {
-        locked {
+        val now = core.clock.nowMs()
+        val full = lock.withLock {
             val s = snapshot ?: return
             if (!enabled || !screenAllowed) return
-            buf.add(Wireframe.tap(s, x, y, core.clock.nowMs()))
-            sealIfFull()
+            buf.add(Wireframe.tap(s, x, y, now))
+            buf.size >= chunkEvents
         }
+        if (full) seal()
     }
 
-    private fun sealIfFull() {
-        if (buf.size >= chunkEvents) seal()
-    }
-
-    private fun dropUnreleased() {
-        if (!released) {
-            buf.clear()
-            pending.clear()
-        }
-    }
-
+    /** Seals the buffer into a spooled chunk. Touches the session first (that writes storage); the spool write is serialised by [sealIo]. */
     private fun seal() {
-        if (buf.isEmpty()) return
+        if (lock.withLock { buf.isEmpty() }) return
         val sid = core.session.touch()
-        if (lastSession != sid) {
-            if (lastSession != null) {
-                seq = 0
-                needsSnapshot = true
-                if (!released) pending.removeAll { it.session == lastSession }  // session ended before the minimum duration
+        sealIo.withLock {
+            var rotated = false
+            val events = lock.withLock {
+                if (buf.isEmpty()) return
+                val evs = ArrayList(buf)
+                buf.clear()
+                rotated = lastSession != sid
+                if (rotated) {
+                    if (lastSession != null) needsSnapshot = true
+                    released = false
+                    sessionStartMs = core.clock.nowMs()
+                }
+                lastSession = sid
+                evs
             }
-            released = false
-            sessionStartMs = core.clock.nowMs()
+            if (rotated) {
+                spool.removeHeld(sid) // the previous session ended before the minimum duration
+                val next = spool.nextSeq(sid) // resumes after a restart inside the same session
+                lock.withLock { seq = next }
+            }
+            val (n, held) = lock.withLock { seq++ to !released }
+            val body = Json.encode(mapOf("session_id" to sid, "window_id" to core.session.windowId, "seq" to n, "events" to events))
+            spool.add(sid, n, held, body)
         }
-        lastSession = sid
-        pending.addLast(Chunk(sid, seq++, ArrayList(buf)))
-        buf.clear()
-        while (pending.size > maxPendingChunks) pending.removeFirst()
     }
 
-    /** Seal what is buffered and POST every pending chunk in order; stops at the first failure. */
+    /** Seal what is buffered and POST every spooled chunk in order; stops at the first failure. */
     fun flush() {
         loadRemote()
         val killed = ReplayPolicy.sampleRate(options.sampleRate, remote) <= 0.0
-        val ok = locked {
-            seal()
-            if (killed) {
-                clear()
-                false
-            } else {
-                val minMs = ReplayPolicy.minDurationMs(options.minDurationMs, remote)
-                if (!released && pending.isNotEmpty()) released = core.clock.nowMs() - sessionStartMs >= minMs
-                released || pending.isEmpty()
+        if (killed) return clear()
+        seal()
+        var releasedSession: String? = null
+        val ok = lock.withLock {
+            val minMs = ReplayPolicy.minDurationMs(options.minDurationMs, remote)
+            if (!released && !spool.isEmpty) {
+                released = core.clock.nowMs() - sessionStartMs >= minMs
+                if (released) releasedSession = lastSession
             }
+            released || spool.isEmpty
         }
+        releasedSession?.let { spool.release(it) }
         if (!ok) return
         while (true) {
-            val c = locked { pending.firstOrNull() } ?: return
-            val body = Json.encode(
-                mapOf("api_key" to core.cfg.apiKey, "session_id" to c.session, "window_id" to core.session.windowId, "seq" to c.seq, "events" to c.events),
-            )
+            val e = spool.entries().firstOrNull { !it.held } ?: return
+            val stored = spool.read(e)
+            if (stored == null) {
+                spool.remove(e)
+                continue
+            }
+            // the stored body is a JSON object: splice the api key in without a decode/encode round trip
+            val body = Json.encode(mapOf("api_key" to core.cfg.apiKey)).dropLast(1) + "," + stored.drop(1)
             val status = runCatching {
                 core.cfg.http.send("POST", "${core.host}/v1/replay?compression=gzip", body, mapOf("Content-Type" to "application/json"), gzip = true).status
             }.getOrDefault(0)
-            locked {
-                if (status in 200..299 || !isRetryable(status) || ++c.tries > MAX_TRIES) {
-                    pending.remove(c)
-                } else {
-                    return
-                }
+            val giveUp = lock.withLock {
+                val n = (tries[e.id] ?: 0) + 1
+                tries[e.id] = n
+                status in 200..299 || !isRetryable(status) || n > MAX_TRIES
             }
+            if (!giveUp) return
+            lock.withLock { tries.remove(e.id) }
+            spool.remove(e)
         }
     }
 
-    /** Drop everything (consent revoked). */
+    /** Drop everything (consent revoked, reset): the buffer and every spooled chunk. */
     fun clear() {
-        locked {
+        lock.withLock {
             buf.clear()
-            pending.clear()
+            tries.clear()
             snapshot = null
             needsSnapshot = true
             released = false
         }
+        spool.clear()
     }
 
     private companion object {

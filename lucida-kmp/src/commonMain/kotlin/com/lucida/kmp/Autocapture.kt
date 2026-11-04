@@ -25,6 +25,7 @@ class Autocapture(private val core: Core, val cfg: AutocaptureConfig) {
     private class Tap(val t: Long, val x: Double, val y: Double)
 
     private val taps = ArrayDeque<Tap>()
+    private val tapsLock = Lock()
 
     /** [chain] runs from the tapped view up to the root. Returns the `$autocapture` event, or null when skipped. */
     fun tap(chain: List<Element>, x: Double, y: Double): Obj? = emit("touch", chain, x, y)
@@ -52,7 +53,7 @@ class Autocapture(private val core: Core, val cfg: AutocaptureConfig) {
         val rc = cfg.rageTap
         if (!rc.enabled) return
         val now = core.clock.nowMs()
-        val near = locked {
+        val near = tapsLock.withLock {
             taps.addLast(Tap(now, x, y))
             while (taps.isNotEmpty() && now - taps.first().t > rc.windowMs) taps.removeFirst()
             val n = taps.count { hypot(it.x - x, it.y - y) <= rc.radiusDp }

@@ -15,14 +15,15 @@ class FakeHttp : HttpPort {
     val gzips = ArrayList<Boolean>()
     @Volatile var statuses = mutableListOf(200)
     @Volatile var response = "{}"
+    private val lock = Lock()
 
     override fun send(method: String, url: String, body: String?, headers: Map<String, String>, gzip: Boolean): HttpResult {
-        locked {
+        lock.withLock {
             calls.add("$method $url")
             gzips.add(gzip)
             if (body != null) bodies.add(body)
         }
-        val s = locked { if (statuses.size > 1) statuses.removeAt(0) else statuses[0] }
+        val s = lock.withLock { if (statuses.size > 1) statuses.removeAt(0) else statuses[0] }
         return HttpResult(s, response)
     }
 }

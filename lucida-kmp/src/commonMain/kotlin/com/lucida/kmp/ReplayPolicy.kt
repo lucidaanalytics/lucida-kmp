@@ -45,22 +45,23 @@ data class MarkerRegion(val role: MarkerRole, val rect: MaskRect)
  */
 object MarkerRegistry {
     private val regions = LinkedHashMap<Any, MarkerRegion>()
+    private val lock = Lock()
 
     fun set(owner: Any, region: MarkerRegion) {
-        locked {
+        lock.withLock {
             regions[owner] = region
         }
     }
 
     fun remove(owner: Any) {
-        locked {
+        lock.withLock {
             regions.remove(owner)
         }
     }
 
-    fun snapshot(): List<MarkerRegion> = locked { regions.values.toList() }
+    fun snapshot(): List<MarkerRegion> = lock.withLock { regions.values.toList() }
 
-    fun clear() = locked { regions.clear() }
+    fun clear() = lock.withLock { regions.clear() }
 }
 
 /** Marker precedence matches iOS and UIKit/View markers: mask always wins over unmask; password-like nodes are never unmasked. */

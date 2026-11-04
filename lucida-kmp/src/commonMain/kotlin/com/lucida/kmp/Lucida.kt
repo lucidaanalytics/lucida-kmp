@@ -51,7 +51,10 @@ class Lucida(
     fun register(props: Obj) = core.register(props)
     fun registerOnce(props: Obj) = core.registerOnce(props)
     fun unregister(key: String) = core.unregister(key)
-    fun setConsent(update: Map<String, Boolean>) = core.setConsent(update)
+    fun setConsent(update: Map<String, Boolean>) {
+        core.setConsent(update)
+        if (!core.consent.has("analytics") || !core.consent.has("replay")) replay.clear()
+    }
     fun isOptedOut() = core.isOptedOut
     fun getAnonymousId() = core.anonymousId
     val distinctId get() = core.distinctId
@@ -69,6 +72,7 @@ class Lucida(
     val tracing get() = core.tracing
 
     fun reset() {
+        replay.clear()
         core.reset()
         io.execute { reloadAll() }
     }

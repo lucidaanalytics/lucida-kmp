@@ -12,6 +12,9 @@ class Flags(
     private val appVersion: String? = null,
     private val options: FlagOptions = FlagOptions(),
 ) {
+    // State lock: guards every field below. A leaf (see Platform.kt): never held across core calls, user callbacks, http or storage.
+    private val lock = Lock()
+    private val ioLock = Lock() // serialises writes of the `lc_flags` cache
     private val personProps = LinkedHashMap<String, Any?>()
     private val groupProps = LinkedHashMap<String, Map<String, Any?>>()
     private val listeners = Listeners<(Obj) -> Unit>()
@@ -40,7 +43,7 @@ class Flags(
     }
 
     init {
-        if (options.sendFeatureFlags) core.enricher = { event -> if (event == "\$snapshot") null else flagEventProps(locked { LinkedHashMap(values) }) }
+        if (options.sendFeatureFlags) core.enricher = { event -> if (event == "\$snapshot") null else flagEventProps(lock.withLock { LinkedHashMap(values) }) }
         // Bootstrap wins over the cache until the first reload replaces it.
         core.cfg.bootstrap?.let {
             values.putAll(it.flags)
@@ -59,12 +62,12 @@ class Flags(
     }
 
     private fun fail() {
-        val s = if (locked { loaded }) FlagsStatus.STALE else FlagsStatus.ERROR
+        val s = if (lock.withLock { loaded }) FlagsStatus.STALE else FlagsStatus.ERROR
         statusListeners.forEach { it(s) }
     }
 
     private fun publish() {
-        locked { loaded = true }
+        lock.withLock { loaded = true }
         val snapshot = all()
         listeners.forEach { it(snapshot) }
         statusListeners.forEach { it(FlagsStatus.CHANGED) }
@@ -72,64 +75,70 @@ class Flags(
 
     /** Person properties used for flag evaluation only (no `$set` event, so no ingestion race). */
     fun setPersonPropertiesForFlags(props: Obj, reload: Boolean = true) {
-        locked { personProps.putAll(props) }
+        lock.withLock { personProps.putAll(props) }
         if (reload) reload()
     }
 
     fun resetPersonPropertiesForFlags(reload: Boolean = true) {
-        locked { personProps.clear() }
+        lock.withLock { personProps.clear() }
         if (reload) reload()
     }
 
     fun setGroupPropertiesForFlags(type: String, props: Map<String, Any?>, reload: Boolean = true) {
-        locked { groupProps[type] = (groupProps[type] ?: emptyMap()) + props }
+        lock.withLock { groupProps[type] = (groupProps[type] ?: emptyMap()) + props }
         if (reload) reload()
     }
 
     fun resetGroupPropertiesForFlags(reload: Boolean = true) {
-        locked { groupProps.clear() }
+        lock.withLock { groupProps.clear() }
         if (reload) reload()
     }
 
     fun setDefinitions(d: List<Obj>) {
-        locked {
+        lock.withLock {
             defs = d
         }
     }
 
-    private fun context(): Obj = buildMap {
-        put("distinct_id", core.distinctId)
-        put("groups", core.groups ?: emptyMap<String, String>())
+    /** Called with [lock] held; [distinctId] and [groups] were read from the core beforehand. */
+    private fun context(distinctId: String, groups: Map<String, String>?): Obj = buildMap {
+        put("distinct_id", distinctId)
+        put("groups", groups ?: emptyMap<String, String>())
         put("person_properties", LinkedHashMap(personProps))
         if (groupProps.isNotEmpty()) put("group_properties", LinkedHashMap(groupProps))
         put("device_properties", deviceProperties)
         appVersion?.let { put("app_version", it) }
     }
 
-    /** Local pass; true when the server must decide (or there are no definitions). */
+    /** Local pass; true when the server must decide (or there are no definitions). Evaluates on a snapshot, outside the lock. */
     private fun evalLocal(): Boolean {
-        return locked {
-            if (defs.isEmpty()) return true
-            var server = false
-            val v = LinkedHashMap<String, Any?>()
-            val p = LinkedHashMap<String, Any?>()
-            evaluateAll(defs, context()).forEach { (k, r) ->
-                if (requiresServer(r)) server = true
-                else {
-                    v[k] = r["value"]
-                    r["payload"]?.let { p[k] = it }
-                    meta[k] = Triple(r["reason"] as? String ?: "", (r["condition_index"] as? Number)?.toInt() ?: -1, true)
-                }
+        val distinctId = core.distinctId
+        val groups = core.groups
+        val (d, ctx) = lock.withLock { defs to context(distinctId, groups) }
+        if (d.isEmpty()) return true
+        var server = false
+        val v = LinkedHashMap<String, Any?>()
+        val p = LinkedHashMap<String, Any?>()
+        val m = HashMap<String, Triple<String, Int, Boolean>>()
+        evaluateAll(d, ctx).forEach { (k, r) ->
+            if (requiresServer(r)) server = true
+            else {
+                v[k] = r["value"]
+                r["payload"]?.let { p[k] = it }
+                m[k] = Triple(r["reason"] as? String ?: "", (r["condition_index"] as? Number)?.toInt() ?: -1, true)
             }
+        }
+        lock.withLock {
             local = v
             values.putAll(v)
             payloads.putAll(p)
-            return server
+            meta.putAll(m)
         }
+        return server
     }
 
     fun reload() {
-        val mine = locked { ++seq }
+        val mine = lock.withLock { ++seq }
         if (!evalLocal()) {
             publish()
             return
@@ -141,8 +150,8 @@ class Flags(
                 put("distinct_id", core.distinctId)
                 core.anonDistinctId?.let { put("anon_distinct_id", it) }
                 put("groups", core.groups ?: emptyMap<String, String>())
-                put("person_properties", locked { LinkedHashMap(personProps) })
-                locked { if (groupProps.isNotEmpty()) put("group_properties", LinkedHashMap(groupProps)) }
+                put("person_properties", lock.withLock { LinkedHashMap(personProps) })
+                lock.withLock { if (groupProps.isNotEmpty()) put("group_properties", LinkedHashMap(groupProps)) }
                 if (options.evaluationContexts.isNotEmpty()) put("evaluation_contexts", options.evaluationContexts)
             },
         )
@@ -164,13 +173,17 @@ class Flags(
                 v[k as String] = x
             }
         }
-        locked {
-            if (mine != seq) return // a newer reload superseded this one
-            requestId = j["request_id"] as? String
-            values = LinkedHashMap(local + v)
-            payloads = p
-            meta.putAll(m)
-            core.storage.set(CACHE, Json.encode(mapOf("values" to values, "payloads" to payloads)))
+        // Apply and snapshot under the state lock, write the cache outside it; ioLock keeps two reloads' writes in order.
+        ioLock.withLock {
+            val cache = lock.withLock {
+                if (mine != seq) return // a newer reload superseded this one
+                requestId = j["request_id"] as? String
+                values = LinkedHashMap(local + v)
+                payloads = p
+                meta.putAll(m)
+                Json.encode(mapOf("values" to values, "payloads" to payloads))
+            }
+            core.storage.set(CACHE, cache)
         }
         publish()
     }
@@ -180,27 +193,27 @@ class Flags(
      * `FlagOptions.fallbacks` with reason `fallback` (no event); null when it has no fallback either.
      */
     fun getFeatureFlagDetails(key: String): FlagDetails? {
-        val known = locked { values.containsKey(key) }
+        val known = lock.withLock { values.containsKey(key) }
         if (!known) return options.fallbacks[key]?.let { FlagDetails(it, null, null, "fallback", -1, null, false) }
         val v = get(key)
-        val (m, rid, pl) = locked { Triple(meta[key], requestId, payloads[key]) }
+        val (m, rid, pl) = lock.withLock { Triple(meta[key], requestId, payloads[key]) }
         return FlagDetails(v, pl, v as? String, m?.first ?: "", m?.second ?: -1, rid, m?.third ?: false)
     }
 
     /** false | true | variant key. Emits `$feature_flag_called` once per key/value; fallbacks emit nothing. */
     fun get(key: String): Any? {
         // a configured fallback is served silently; a missing flag without one still reports `false`
-        val v = locked { if (values.containsKey(key)) values[key] ?: false else null }
+        val v = lock.withLock { if (values.containsKey(key)) values[key] ?: false else null }
             ?: options.fallbacks[key]?.let { return it } ?: false
-        if (options.sendFeatureFlagEvent && locked { called.add("$key=$v") }) {
+        if (options.sendFeatureFlagEvent && lock.withLock { called.add("$key=$v") }) {
             core.capture("\$feature_flag_called", mapOf("\$feature_flag" to key, "\$feature_flag_response" to v))
         }
         return v
     }
 
     fun isEnabled(key: String) = get(key) != false
-    fun payload(key: String): Any? = locked { payloads[key] }
-    fun all(): Obj = locked { LinkedHashMap(values) }
+    fun payload(key: String): Any? = lock.withLock { payloads[key] }
+    fun all(): Obj = lock.withLock { LinkedHashMap(values) }
 
     private companion object {
         const val CACHE = "lc_flags"
