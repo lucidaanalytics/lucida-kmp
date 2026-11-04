@@ -70,6 +70,8 @@ tasks.withType<KotlinNativeSimulatorTest>().configureEach {
     environment("SIMCTL_CHILD_LUCIDA_TESTDATA", System.getenv("LUCIDA_TESTDATA") ?: rootDir.resolve("../../testdata").canonicalPath)
     // Explicit opt-out for runners whose simulator has no usable keychain (see README "iOS keychain test").
     System.getenv("LUCIDA_SKIP_KEYCHAIN_TEST")?.let { environment("SIMCTL_CHILD_LUCIDA_SKIP_KEYCHAIN_TEST", it) }
+    // Each test is logged as it starts, so a hang in CI names the test that hung.
+    testLogging { events("started", "passed", "skipped", "failed"); showStandardStreams = true }
 }
 
 // Keychain entitlement for the iOS test host: the simulator takes entitlements from the Mach-O `__TEXT,__entitlements`
