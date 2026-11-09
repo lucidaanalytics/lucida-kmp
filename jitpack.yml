@@ -1,0 +1,5 @@
+# JitPack serves a single-module repo as com.github.<org>:<repo>:<tag>. Apple targets are skipped on JitPack's Linux hosts.
+jdk:
+  - openjdk17
+install:
+  - ./gradlew --no-daemon --console=plain -PlucidaGroup=com.github.lucidaanalytics publishToMavenLocal -x test

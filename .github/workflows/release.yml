@@ -6,6 +6,8 @@ permissions: {}
 jobs:
   release:
     runs-on: macos-latest
+    env:
+      HAS_CENTRAL: ${{ secrets.MAVEN_CENTRAL_PASSWORD != '' }}
     permissions:
       contents: write
       id-token: write
@@ -16,15 +18,9 @@ jobs:
         with:
           distribution: temurin
           java-version: "17"
-      # Central has no OIDC publishing: the Portal token and the GPG key are repository secrets
-      # (com.vanniktech.maven.publish reads the ORG_GRADLE_PROJECT_* variables).
-      - name: Sign and publish to Maven Central
-        run: ./gradlew --no-daemon --console=plain publishToMavenCentral --no-configuration-cache
-        env:
-          ORG_GRADLE_PROJECT_mavenCentralUsername: ${{ secrets.MAVEN_CENTRAL_USERNAME }}
-          ORG_GRADLE_PROJECT_mavenCentralPassword: ${{ secrets.MAVEN_CENTRAL_PASSWORD }}
-          ORG_GRADLE_PROJECT_signingInMemoryKey: ${{ secrets.SIGNING_KEY }}
-          ORG_GRADLE_PROJECT_signingInMemoryKeyPassword: ${{ secrets.SIGNING_PASSWORD }}
+      # aar and jar files only; JitPack serves the tag with the jitpack.yml in this repo.
+      - name: Assemble
+        run: ./gradlew --no-daemon --console=plain assemble --no-configuration-cache
       - uses: actions/attest-build-provenance@4d101475d8b20a2381f78447822ac1eab6504dd8 # v4.2.2
         with:
           subject-path: |
@@ -34,3 +30,13 @@ jobs:
         env:
           GH_TOKEN: ${{ github.token }}
         run: gh release create "$GITHUB_REF_NAME" $(find . -path '*/build/outputs/aar/*-release.aar' -o -path '*/build/libs/*.jar') --generate-notes --verify-tag
+      # Central has no OIDC publishing: this runs only when the Portal token (MAVEN_CENTRAL_PASSWORD) is set
+      # (com.vanniktech.maven.publish reads the ORG_GRADLE_PROJECT_* variables).
+      - name: Sign and publish to Maven Central
+        if: env.HAS_CENTRAL == 'true'
+        run: ./gradlew --no-daemon --console=plain publishToMavenCentral --no-configuration-cache
+        env:
+          ORG_GRADLE_PROJECT_mavenCentralUsername: ${{ secrets.MAVEN_CENTRAL_USERNAME }}
+          ORG_GRADLE_PROJECT_mavenCentralPassword: ${{ secrets.MAVEN_CENTRAL_PASSWORD }}
+          ORG_GRADLE_PROJECT_signingInMemoryKey: ${{ secrets.SIGNING_KEY }}
+          ORG_GRADLE_PROJECT_signingInMemoryKeyPassword: ${{ secrets.SIGNING_PASSWORD }}

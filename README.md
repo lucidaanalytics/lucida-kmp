@@ -30,12 +30,18 @@ container.
 
 ## Install
 
+From GitHub, [lucidaanalytics/lucida-kmp](https://github.com/lucidaanalytics/lucida-kmp), release `v0.1.0`:
+
 ```kotlin
-// settings.gradle.kts / build.gradle.kts of your KMP module (publishing coordinates are set when the artifact is released)
+// settings.gradle.kts
+dependencyResolutionManagement { repositories { maven("https://jitpack.io") } }
+// build.gradle.kts of your KMP module
 kotlin {
-    sourceSets.commonMain.dependencies { implementation(project(":lucida-kmp")) }
+    sourceSets.commonMain.dependencies { implementation("com.github.lucidaanalytics:lucida-kmp:v0.1.0") }
 }
 ```
+
+JitPack builds on Linux, so it serves the JVM and Android targets; Apple targets need a macOS build, and the release's jars are the JVM ones. Maven Central (`io.github.lucidaanalytics:lucida-kmp`) is coming.
 
 ## Usage
 
