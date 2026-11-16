@@ -8,3 +8,7 @@ updates:
     directory: /
     schedule:
       interval: weekly
+    ignore:
+      # Gradle 9 removed internals the pinned Kotlin/AGP plugins use (DefaultArtifactPublicationSet); bump wrapper+plugins together in the monorepo.
+      - dependency-name: gradle-wrapper
+        update-types: ["version-update:semver-major"]
